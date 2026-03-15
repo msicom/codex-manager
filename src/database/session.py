@@ -94,6 +94,7 @@ class DatabaseSessionManager:
             # (表名, 列名, 列类型)
             ("accounts", "cpa_uploaded", "BOOLEAN DEFAULT 0"),
             ("accounts", "cpa_uploaded_at", "DATETIME"),
+            ("accounts", "source", "VARCHAR(20) DEFAULT 'register'"),
         ]
 
         with self.engine.connect() as conn:

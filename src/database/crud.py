@@ -30,7 +30,8 @@ def create_account(
     proxy_used: Optional[str] = None,
     expires_at: Optional['datetime'] = None,
     extra_data: Optional[Dict[str, Any]] = None,
-    status: Optional[str] = None
+    status: Optional[str] = None,
+    source: Optional[str] = None
 ) -> Account:
     """创建新账户"""
     db_account = Account(
@@ -49,6 +50,7 @@ def create_account(
         expires_at=expires_at,
         extra_data=extra_data or {},
         status=status or 'active',
+        source=source or 'register',
         registered_at=datetime.utcnow()
     )
     db.add(db_account)

@@ -66,6 +66,12 @@ OPENAI_API_ENDPOINTS = {
     "select_workspace": "https://auth.openai.com/api/accounts/workspace/select",
 }
 
+# OpenAI 页面类型（用于判断账号状态）
+OPENAI_PAGE_TYPES = {
+    "EMAIL_OTP_VERIFICATION": "email_otp_verification",  # 已注册账号，需要 OTP 验证
+    "PASSWORD_REGISTRATION": "password",  # 新账号，需要设置密码
+}
+
 # ============================================================================
 # 邮箱服务相关常量
 # ============================================================================
