@@ -351,26 +351,42 @@ async def export_accounts_csv(request: BatchExportRequest):
 
 @router.post("/export/cpa")
 async def export_accounts_cpa(request: BatchExportRequest):
-    """导出账号为 CPA Token JSON 格式"""
+    """导出账号为 CPA Token JSON 格式（每个账号单独一个 JSON 文件，打包为 ZIP）"""
+    import io
+    import zipfile
     from ...core.cpa_upload import generate_token_json
 
     with get_db() as db:
         accounts = db.query(Account).filter(Account.id.in_(request.ids)).all()
 
-        # 生成 CPA 格式的 Token 数组
-        export_data = [generate_token_json(acc) for acc in accounts]
-
-        # 生成文件名
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"cpa_tokens_{timestamp}.json"
 
-        # 返回 JSON 响应
-        content = json.dumps(export_data, ensure_ascii=False, indent=2)
+        if len(accounts) == 1:
+            # 单个账号直接返回 JSON 文件
+            acc = accounts[0]
+            token_data = generate_token_json(acc)
+            content = json.dumps(token_data, ensure_ascii=False, indent=2)
+            filename = f"{acc.email}.json"
+            return StreamingResponse(
+                iter([content]),
+                media_type="application/json",
+                headers={"Content-Disposition": f"attachment; filename={filename}"}
+            )
 
+        # 多个账号打包为 ZIP
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for acc in accounts:
+                token_data = generate_token_json(acc)
+                content = json.dumps(token_data, ensure_ascii=False, indent=2)
+                zf.writestr(f"{acc.email}.json", content)
+
+        zip_buffer.seek(0)
+        zip_filename = f"cpa_tokens_{timestamp}.zip"
         return StreamingResponse(
-            iter([content]),
-            media_type="application/json",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
+            zip_buffer,
+            media_type="application/zip",
+            headers={"Content-Disposition": f"attachment; filename={zip_filename}"}
         )
 
 

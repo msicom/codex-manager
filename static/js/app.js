@@ -71,7 +71,16 @@ const elements = {
     outlookAccountsContainer: document.getElementById('outlook-accounts-container'),
     outlookIntervalMin: document.getElementById('outlook-interval-min'),
     outlookIntervalMax: document.getElementById('outlook-interval-max'),
-    outlookSkipRegistered: document.getElementById('outlook-skip-registered')
+    outlookSkipRegistered: document.getElementById('outlook-skip-registered'),
+    outlookConcurrencyMode: document.getElementById('outlook-concurrency-mode'),
+    outlookConcurrencyCount: document.getElementById('outlook-concurrency-count'),
+    outlookConcurrencyHint: document.getElementById('outlook-concurrency-hint'),
+    outlookIntervalGroup: document.getElementById('outlook-interval-group'),
+    // 批量并发控件
+    concurrencyMode: document.getElementById('concurrency-mode'),
+    concurrencyCount: document.getElementById('concurrency-count'),
+    concurrencyHint: document.getElementById('concurrency-hint'),
+    intervalGroup: document.getElementById('interval-group')
 };
 
 // 初始化
@@ -108,6 +117,14 @@ function initEventListeners() {
     elements.refreshAccountsBtn.addEventListener('click', () => {
         loadRecentAccounts();
         toast.info('已刷新');
+    });
+
+    // 并发模式切换
+    elements.concurrencyMode.addEventListener('change', () => {
+        handleConcurrencyModeChange(elements.concurrencyMode, elements.concurrencyHint, elements.intervalGroup);
+    });
+    elements.outlookConcurrencyMode.addEventListener('change', () => {
+        handleConcurrencyModeChange(elements.outlookConcurrencyMode, elements.outlookConcurrencyHint, elements.outlookIntervalGroup);
     });
 }
 
@@ -259,6 +276,18 @@ function handleModeChange(e) {
 
     elements.batchCountGroup.style.display = isBatchMode ? 'block' : 'none';
     elements.batchOptions.style.display = isBatchMode ? 'block' : 'none';
+}
+
+// 并发模式切换（批量）
+function handleConcurrencyModeChange(selectEl, hintEl, intervalGroupEl) {
+    const mode = selectEl.value;
+    if (mode === 'parallel') {
+        hintEl.textContent = '所有任务分成 N 个并发批次同时执行';
+        intervalGroupEl.style.display = 'none';
+    } else {
+        hintEl.textContent = '同时最多运行 N 个任务，每隔 interval 秒启动新任务';
+        intervalGroupEl.style.display = 'block';
+    }
 }
 
 // 开始注册
@@ -472,10 +501,14 @@ async function handleBatchRegistration(requestData) {
     const count = parseInt(elements.batchCount.value) || 5;
     const intervalMin = parseInt(elements.intervalMin.value) || 5;
     const intervalMax = parseInt(elements.intervalMax.value) || 30;
+    const concurrency = parseInt(elements.concurrencyCount.value) || 3;
+    const mode = elements.concurrencyMode.value || 'pipeline';
 
     requestData.count = count;
     requestData.interval_min = intervalMin;
     requestData.interval_max = intervalMax;
+    requestData.concurrency = Math.min(50, Math.max(1, concurrency));
+    requestData.mode = mode;
 
     addLog('info', `[系统] 正在启动批量注册任务 (数量: ${count})...`);
 
@@ -966,6 +999,8 @@ async function handleOutlookBatchRegistration() {
     const intervalMin = parseInt(elements.outlookIntervalMin.value) || 5;
     const intervalMax = parseInt(elements.outlookIntervalMax.value) || 30;
     const skipRegistered = elements.outlookSkipRegistered.checked;
+    const concurrency = parseInt(elements.outlookConcurrencyCount.value) || 3;
+    const mode = elements.outlookConcurrencyMode.value || 'pipeline';
 
     // 禁用开始按钮
     elements.startBtn.disabled = true;
@@ -978,7 +1013,9 @@ async function handleOutlookBatchRegistration() {
         service_ids: selectedIds,
         skip_registered: skipRegistered,
         interval_min: intervalMin,
-        interval_max: intervalMax
+        interval_max: intervalMax,
+        concurrency: Math.min(50, Math.max(1, concurrency)),
+        mode: mode
     };
 
     addLog('info', `[系统] 正在启动 Outlook 批量注册 (${selectedIds.length} 个账户)...`);
