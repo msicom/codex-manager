@@ -10,6 +10,7 @@ import logging
 import select
 import time
 import threading
+from datetime import datetime, timedelta, timezone
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 from typing import Dict, List, Optional
@@ -40,6 +41,7 @@ class IMAPConnectionPool:
         timeout: int = 30,
     ) -> imaplib.IMAP4_SSL:
         """获取或新建 IMAP 连接"""
+        # 先在锁内检查现有连接
         with self._lock:
             conn = self._connections.get(email_addr)
             if conn:
@@ -48,16 +50,28 @@ class IMAPConnectionPool:
                     return conn
                 except Exception:
                     self._close_one(email_addr)
+            # 标记为「建连中」，防止重复建连
+            self._connections[email_addr] = None
 
-            conn = imaplib.IMAP4_SSL(self.IMAP_HOST, self.IMAP_PORT, timeout=timeout)
+        # 锁外建立新连接（耗时操作不持锁）
+        try:
+            new_conn = imaplib.IMAP4_SSL(self.IMAP_HOST, self.IMAP_PORT, timeout=timeout)
             auth_str = f"user={email_addr}\x01auth=Bearer {token}\x01\x01"
-            conn.authenticate("XOAUTH2", lambda _: auth_str.encode("utf-8"))
-            self._connections[email_addr] = conn
+            new_conn.authenticate("XOAUTH2", lambda _: auth_str.encode("utf-8"))
+        except Exception:
+            with self._lock:
+                # 建连失败，清除占位
+                if self._connections.get(email_addr) is None:
+                    del self._connections[email_addr]
+            raise
+
+        with self._lock:
+            self._connections[email_addr] = new_conn
             logger.debug(f"[{email_addr}] IMAP 新连接已建立")
-            return conn
+            return new_conn
 
     def invalidate(self, email_addr: str):
-        """废弃连接（认证失败时调用）"""
+        """废弃连接（认证失败或连接异常时调用）"""
         with self._lock:
             self._close_one(email_addr)
 
@@ -91,6 +105,8 @@ class IMAPNewProvider(OutlookProvider):
         super().__init__(account, config)
         self._conn: Optional[imaplib.IMAP4_SSL] = None
         self._token_manager: Optional[TokenManager] = None
+        self._idle_tag_counter = 0
+        self._idle_tag_lock = threading.Lock()
 
         if not account.has_oauth():
             logger.warning(
@@ -106,6 +122,12 @@ class IMAPNewProvider(OutlookProvider):
                 service_id=self.config.service_id,
             )
         return self._token_manager
+
+    def _next_idle_tag(self) -> str:
+        """生成唯一 IDLE tag（避免使用私有 _new_tag）"""
+        with self._idle_tag_lock:
+            self._idle_tag_counter += 1
+            return f"IDLE{self._idle_tag_counter:04d}"
 
     def connect(self) -> bool:
         """从连接池获取连接"""
@@ -170,22 +192,38 @@ class IMAPNewProvider(OutlookProvider):
         self,
         count: int = 20,
         only_unseen: bool = True,
+        since_minutes: Optional[int] = None,
     ) -> List[EmailMessage]:
-        """获取最近的邮件"""
+        """
+        获取最近的邮件。
+
+        搜索策略：
+        - since_minutes 指定时：用 SINCE 日期 + ALL 搜索最近N分钟内的邮件（不受已读/未读限制）
+        - only_unseen=True 且未指定 since_minutes：搜索 UNSEEN
+        - only_unseen=False 且未指定 since_minutes：搜索全部（取最近 count 封）
+        """
         if not self._connected:
             if not self.connect():
                 return []
 
         try:
             self._conn.select("INBOX", readonly=True)
-            flag = "UNSEEN" if only_unseen else "ALL"
-            status, data = self._conn.search(None, flag)
+
+            if since_minutes is not None:
+                # 按时间范围搜索：SINCE 某天（IMAP 只支持按天，精度为天）
+                since_dt = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+                since_str = since_dt.strftime("%d-%b-%Y")
+                status, data = self._conn.search(None, f"SINCE {since_str}")
+            elif only_unseen:
+                status, data = self._conn.search(None, "UNSEEN")
+            else:
+                status, data = self._conn.search(None, "ALL")
 
             if status != "OK" or not data or not data[0]:
                 return []
 
             ids = data[0].split()
-            recent_ids = ids[-count:][::-1]
+            recent_ids = ids[-count:][::-1]  # 取最新的 count 封，倒序（最新在前）
 
             emails = []
             for msg_id in recent_ids:
@@ -239,18 +277,18 @@ class IMAPNewProvider(OutlookProvider):
             logger.warning(f"[{self.account.email}] IDLE 前 SELECT 失败: {e}")
             return False
 
-        logger.info(f"[{self.account.email}] 进入 IMAP IDLE 等待模式（超时 {timeout}s）")
-
+        tag = self._next_idle_tag()
         sock = self._conn.socket()
-        tag = self._conn._new_tag().decode() if isinstance(self._conn._new_tag(), bytes) else self._conn._new_tag()
+        logger.info(f"[{self.account.email}] 进入 IMAP IDLE 等待模式（超时 {timeout}s，tag={tag}）")
 
         try:
             # 发送 IDLE 命令
             self._conn.send(f"{tag} IDLE\r\n".encode())
 
-            # 等待 "+" 延续响应
-            deadline = time.time() + timeout
+            # 等待 "+" 延续响应（服务端确认进入 IDLE）
+            deadline = time.time() + min(10.0, timeout)
             buf = b""
+            got_continuation = False
             while time.time() < deadline:
                 ready = select.select([sock], [], [], min(2.0, deadline - time.time()))
                 if ready[0]:
@@ -259,13 +297,21 @@ class IMAPNewProvider(OutlookProvider):
                         break
                     buf += chunk
                     if b"+ " in buf or b"+\r\n" in buf:
+                        got_continuation = True
                         break
+
+            if not got_continuation:
+                logger.warning(f"[{self.account.email}] 未收到 IDLE 延续响应，放弃")
+                return False
 
             # 等待 EXISTS / RECENT 推送
             got_new = False
             buf = b""
+            deadline = time.time() + timeout
             while time.time() < deadline:
                 remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
                 ready = select.select([sock], [], [], min(2.0, remaining))
                 if ready[0]:
                     chunk = sock.recv(4096)
@@ -273,6 +319,7 @@ class IMAPNewProvider(OutlookProvider):
                         break
                     buf += chunk
                     if b"EXISTS" in buf or b"RECENT" in buf:
+                        logger.debug(f"[{self.account.email}] IDLE 收到新邮件推送")
                         got_new = True
                         break
 
@@ -283,23 +330,25 @@ class IMAPNewProvider(OutlookProvider):
             return False
 
         finally:
-            # 发送 DONE 结束 IDLE
+            # 发送 DONE 结束 IDLE，并排空服务端响应
             try:
                 self._conn.send(b"DONE\r\n")
-                # 读取 IDLE 结束响应（避免缓冲区污染后续命令）
-                deadline2 = time.time() + 5
-                resp_buf = b""
-                while time.time() < deadline2:
+                drain_deadline = time.time() + 5
+                drain_buf = b""
+                tag_end = f"{tag} OK".encode()
+                tag_no = f"{tag} NO".encode()
+                tag_bad = f"{tag} BAD".encode()
+                while time.time() < drain_deadline:
                     ready = select.select([sock], [], [], 1.0)
-                    if ready[0]:
-                        chunk = sock.recv(4096)
-                        if not chunk:
-                            break
-                        resp_buf += chunk
-                        if tag.encode() in resp_buf:
-                            break
+                    if not ready[0]:
+                        break
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    drain_buf += chunk
+                    if any(t in drain_buf for t in (tag_end, tag_no, tag_bad)):
+                        break
             except Exception:
-                # DONE 发送失败则废弃连接
                 _imap_pool.invalidate(self.account.email)
                 self._connected = False
                 self._conn = None
@@ -316,7 +365,7 @@ class IMAPNewProvider(OutlookProvider):
 
 
 def _parse_email(raw: bytes) -> EmailMessage:
-    """解析原始邮件为 EmailMessage"""
+    """解析原始邮件为 EmailMessage（优先 text/plain，次选 text/html）"""
     msg = email.message_from_bytes(raw)
 
     def _decode(val):
@@ -348,30 +397,42 @@ def _parse_email(raw: bytes) -> EmailMessage:
         except Exception:
             pass
 
-    body = ""
-    body_preview = ""
+    # 提取正文：优先 text/plain，次选 text/html
+    plain_body = ""
+    html_body = ""
     if msg.is_multipart():
         for part in msg.walk():
             ct = part.get_content_type()
             cd = str(part.get("Content-Disposition", ""))
-            if "attachment" not in cd.lower() and ct in ("text/plain", "text/html"):
-                try:
-                    charset = part.get_content_charset() or "utf-8"
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        body = payload.decode(charset, errors="replace")
-                        break
-                except Exception:
-                    pass
+            if "attachment" in cd.lower():
+                continue
+            try:
+                charset = part.get_content_charset() or "utf-8"
+                payload = part.get_payload(decode=True)
+                if not payload:
+                    continue
+                decoded = payload.decode(charset, errors="replace")
+                if ct == "text/plain" and not plain_body:
+                    plain_body = decoded
+                elif ct == "text/html" and not html_body:
+                    html_body = decoded
+            except Exception:
+                pass
     else:
         try:
             charset = msg.get_content_charset() or "utf-8"
             payload = msg.get_payload(decode=True)
             if payload:
-                body = payload.decode(charset, errors="replace")
+                ct = msg.get_content_type()
+                decoded = payload.decode(charset, errors="replace")
+                if ct == "text/plain":
+                    plain_body = decoded
+                else:
+                    html_body = decoded
         except Exception:
             pass
 
+    body = plain_body or html_body
     body_preview = body[:200].strip()
 
     msg_id = msg.get("Message-ID", "").strip("<>")

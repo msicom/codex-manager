@@ -97,17 +97,29 @@ class OutlookService(BaseEmailService):
             if not account.client_id and _default_client_id:
                 account.client_id = _default_client_id
             if account.validate():
-                self.accounts.append(account)
+                if not account.has_oauth():
+                    logger.warning(
+                        f"[{account.email}] 跳过：IMAP_NEW 仅支持 OAuth2，"
+                        f"请配置 client_id 和 refresh_token"
+                    )
+                else:
+                    self.accounts.append(account)
         else:
             for ac in self.config.get("accounts", []):
                 account = OutlookAccount.from_config(ac)
                 if not account.client_id and _default_client_id:
                     account.client_id = _default_client_id
                 if account.validate():
-                    self.accounts.append(account)
+                    if not account.has_oauth():
+                        logger.warning(
+                            f"[{account.email}] 跳过：IMAP_NEW 仅支持 OAuth2，"
+                            f"请配置 client_id 和 refresh_token"
+                        )
+                    else:
+                        self.accounts.append(account)
 
         if not self.accounts:
-            logger.warning("未配置有效的 Outlook 账户")
+            logger.warning("未配置有效的 Outlook 账户（需要 client_id + refresh_token）")
 
         # 健康检查器
         self.health_checker = HealthChecker(
@@ -143,6 +155,7 @@ class OutlookService(BaseEmailService):
         account: OutlookAccount,
         count: int = 15,
         only_unseen: bool = True,
+        since_minutes: Optional[int] = None,
         use_cache: bool = False,
     ) -> List[EmailMessage]:
         """通过 IMAP_NEW Provider 获取邮件，可选使用内存缓存"""
@@ -159,7 +172,9 @@ class OutlookService(BaseEmailService):
             provider = self._get_provider(account)
             with self._imap_semaphore:
                 with provider:
-                    emails = provider.get_recent_emails(count, only_unseen)
+                    emails = provider.get_recent_emails(
+                        count, only_unseen, since_minutes=since_minutes
+                    )
 
             if emails:
                 self.health_checker.record_success()
@@ -227,11 +242,11 @@ class OutlookService(BaseEmailService):
 
         if use_idle:
             code = self._wait_with_idle(
-                account, email, actual_timeout, min_timestamp, used_codes
+                account, email, actual_timeout, min_timestamp, used_codes, otp_sent_at
             )
         else:
             code = self._wait_with_poll(
-                account, email, actual_timeout, poll_interval, min_timestamp, used_codes
+                account, email, actual_timeout, poll_interval, min_timestamp, used_codes, otp_sent_at
             )
 
         if code:
@@ -248,16 +263,27 @@ class OutlookService(BaseEmailService):
         poll_interval: int,
         min_timestamp: float,
         used_codes: set,
+        otp_sent_at: Optional[float] = None,
     ) -> Optional[str]:
         """轮询方式等待验证码"""
         start_time = time.time()
         poll_count = 0
 
+        # 计算 since_minutes：从发送时间前2分钟开始搜索，最多查180分钟
+        since_minutes: Optional[int] = None
+        if otp_sent_at:
+            elapsed_since_send = int((time.time() - otp_sent_at) / 60) + 2
+            since_minutes = min(elapsed_since_send, 180)
+
         while time.time() - start_time < timeout:
             poll_count += 1
-            only_unseen = poll_count <= 3
+            # 有 since_minutes 时用 SINCE 搜索（覆盖已读/未读），否则前3次用 UNSEEN
+            only_unseen = (since_minutes is None) and (poll_count <= 3)
             try:
-                emails = self._fetch_emails(account, count=15, only_unseen=only_unseen)
+                emails = self._fetch_emails(
+                    account, count=15, only_unseen=only_unseen,
+                    since_minutes=since_minutes,
+                )
                 if emails:
                     code = self.email_parser.find_verification_code_in_emails(
                         emails,
@@ -286,13 +312,20 @@ class OutlookService(BaseEmailService):
         timeout: int,
         min_timestamp: float,
         used_codes: set,
+        otp_sent_at: Optional[float] = None,
     ) -> Optional[str]:
         """IMAP IDLE 方式等待验证码，失败时自动降级为轮询"""
         if not self.health_checker.is_available():
             logger.warning(f"[{email}] IMAP_NEW 不可用，降级为轮询")
             return self._wait_with_poll(
-                account, email, timeout, 3, min_timestamp, used_codes
+                account, email, timeout, 3, min_timestamp, used_codes, otp_sent_at
             )
+
+        # 计算 since_minutes：从发送时间前2分钟开始，最多180分钟
+        since_minutes: Optional[int] = None
+        if otp_sent_at:
+            elapsed_since_send = int((time.time() - otp_sent_at) / 60) + 2
+            since_minutes = min(elapsed_since_send, 180)
 
         start_time = time.time()
         try:
@@ -300,7 +333,9 @@ class OutlookService(BaseEmailService):
             with self._imap_semaphore:
                 with provider:
                     # 先做一次即时检查
-                    emails = provider.get_recent_emails(15, only_unseen=True)
+                    emails = provider.get_recent_emails(
+                        15, only_unseen=(since_minutes is None), since_minutes=since_minutes
+                    )
                     code = self.email_parser.find_verification_code_in_emails(
                         emails,
                         target_email=email,
@@ -320,7 +355,14 @@ class OutlookService(BaseEmailService):
                         arrived = provider.wait_for_new_email_idle(timeout=min(remaining, 25))
                         # 无效化缓存，强制重新拉取
                         self._email_cache.invalidate(email)
-                        emails = provider.get_recent_emails(15, only_unseen=True)
+                        # IDLE 触发后用 since_minutes 搜索，覆盖已读邮件
+                        fetch_since = since_minutes
+                        if fetch_since is None:
+                            # 没有 otp_sent_at 时，用距当前时间2分钟内的邮件
+                            fetch_since = 2
+                        emails = provider.get_recent_emails(
+                            15, only_unseen=False, since_minutes=fetch_since
+                        )
                         code = self.email_parser.find_verification_code_in_emails(
                             emails,
                             target_email=email,
@@ -343,7 +385,7 @@ class OutlookService(BaseEmailService):
                 code_settings = _get_code_settings()
                 return self._wait_with_poll(
                     account, email, remaining,
-                    code_settings["poll_interval"], min_timestamp, used_codes
+                    code_settings["poll_interval"], min_timestamp, used_codes, otp_sent_at
                 )
 
         logger.warning(f"[{email}] IDLE 等待验证码超时 ({timeout}s)")

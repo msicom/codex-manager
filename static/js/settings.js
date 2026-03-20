@@ -673,22 +673,27 @@ async function handleOutlookBatchImport() {
 
     lines.forEach((line, index) => {
         const parts = line.split('----').map(p => p.trim());
-        if (parts.length < 2) {
-            errors.push(`第 ${index + 1} 行格式错误`);
+        if (parts.length < 4) {
+            errors.push(`第 ${index + 1} 行格式错误，必须为 邮箱----密码----client_id----refresh_token`);
             return;
         }
 
         const account = {
             email: parts[0],
             password: parts[1],
-            client_id: parts[2] || null,
-            refresh_token: parts[3] || null,
+            client_id: parts[2],
+            refresh_token: parts[3],
             enabled: enabled,
             priority: priority
         };
 
         if (!account.email.includes('@')) {
             errors.push(`第 ${index + 1} 行邮箱格式错误: ${account.email}`);
+            return;
+        }
+
+        if (!account.client_id || !account.refresh_token) {
+            errors.push(`第 ${index + 1} 行 client_id 或 refresh_token 不能为空`);
             return;
         }
 
