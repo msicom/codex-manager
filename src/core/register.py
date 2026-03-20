@@ -796,6 +796,7 @@ class RegistrationEngine:
                     return result
             else:
                 self._log("9. Outlook 邮箱，跳过发送验证码环节")
+                self._otp_sent_at = time.time()  # 记录时间戳，供后续按时间范围搜索邮件
 
             # 10. 获取验证码
             self._log("10. 等待验证码...")
