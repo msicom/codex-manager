@@ -552,6 +552,12 @@ function connectWebSocket(taskUuid) {
                 const logType = getLogType(data.message);
                 addLog(logType, data.message);
             } else if (data.type === 'status') {
+                if (data.email) {
+                    elements.taskEmail.textContent = data.email;
+                }
+                if (data.email_service) {
+                    elements.taskService.textContent = getServiceTypeText(data.email_service);
+                }
                 updateTaskStatus(data.status);
 
                 // 检查是否完成
