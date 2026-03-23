@@ -1077,6 +1077,8 @@ class RegistrationEngine:
         if not password_ok:
             return None, None
 
+        self._otp_sent_at = time.time()
+
         code = self._get_verification_code()
         if not code:
             self._log("登录流程获取验证码失败", "warning")

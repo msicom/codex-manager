@@ -6,24 +6,23 @@ from src.web.routes import registration as registration_routes
 from src.web.task_manager import task_manager
 
 
-def test_init_batch_state_keeps_batch_tasks_and_task_manager_in_sync():
+def test_init_batch_state_persists_state_in_task_manager():
     batch_id = "batch-sync-init"
     task_uuids = ["task-1", "task-2", "task-3"]
 
-    registration_routes.batch_tasks.pop(batch_id, None)
     registration_routes._init_batch_state(batch_id, task_uuids)
 
-    batch_snapshot = registration_routes.batch_tasks[batch_id]
     manager_snapshot = task_manager.get_batch_status(batch_id)
 
     assert manager_snapshot is not None
-    assert batch_snapshot["total"] == manager_snapshot["total"] == 3
-    assert batch_snapshot["completed"] == manager_snapshot["completed"] == 0
-    assert batch_snapshot["success"] == manager_snapshot["success"] == 0
-    assert batch_snapshot["failed"] == manager_snapshot["failed"] == 0
-    assert batch_snapshot["finished"] is False
+    assert manager_snapshot["task_uuids"] == task_uuids
+    assert manager_snapshot["total"] == 3
+    assert manager_snapshot["completed"] == 0
+    assert manager_snapshot["success"] == 0
+    assert manager_snapshot["failed"] == 0
     assert manager_snapshot["finished"] is False
     assert manager_snapshot["status"] == "running"
+    assert task_manager.get_batch_logs(batch_id) == []
 
 
 def test_run_batch_parallel_keeps_counter_updates_in_sync(monkeypatch):
@@ -61,7 +60,6 @@ def test_run_batch_parallel_keeps_counter_updates_in_sync(monkeypatch):
         error_message = None if status == "completed" else f"{task_uuid}-error"
         return SimpleNamespace(status=status, error_message=error_message)
 
-    registration_routes.batch_tasks.pop(batch_id, None)
     monkeypatch.setattr(registration_routes, "run_registration_task", fake_run_registration_task)
     monkeypatch.setattr(registration_routes, "get_db", fake_get_db)
     monkeypatch.setattr(registration_routes.crud, "get_registration_task", fake_get_registration_task)
@@ -78,13 +76,11 @@ def test_run_batch_parallel_keeps_counter_updates_in_sync(monkeypatch):
         )
     )
 
-    batch_snapshot = registration_routes.batch_tasks[batch_id]
     manager_snapshot = task_manager.get_batch_status(batch_id)
 
     assert manager_snapshot is not None
-    assert batch_snapshot["completed"] == manager_snapshot["completed"] == 3
-    assert batch_snapshot["success"] == manager_snapshot["success"] == 2
-    assert batch_snapshot["failed"] == manager_snapshot["failed"] == 1
-    assert batch_snapshot["finished"] is True
+    assert manager_snapshot["completed"] == 3
+    assert manager_snapshot["success"] == 2
+    assert manager_snapshot["failed"] == 1
     assert manager_snapshot["finished"] is True
     assert manager_snapshot["status"] == "completed"

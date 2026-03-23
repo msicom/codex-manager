@@ -240,18 +240,25 @@ class TaskManager:
 
     # ============== 批量任务管理 ==============
 
-    def init_batch(self, batch_id: str, total: int):
+    def init_batch(self, batch_id: str, total: int, **kwargs):
         """初始化批量任务"""
-        _batch_status[batch_id] = {
-            "status": "running",
-            "total": total,
-            "completed": 0,
-            "success": 0,
-            "failed": 0,
-            "skipped": 0,
-            "current_index": 0,
-            "finished": False
-        }
+        with _get_batch_lock(batch_id):
+            previous = _batch_status.get(batch_id, {})
+            status = {
+                "status": "running",
+                "total": total,
+                "completed": 0,
+                "success": 0,
+                "failed": 0,
+                "skipped": previous.get("skipped", 0),
+                "cancelled": previous.get("cancelled", False),
+                "current_index": 0,
+                "finished": False,
+            }
+            status.update(previous)
+            status.update(kwargs)
+            status["total"] = total
+            _batch_status[batch_id] = status
         logger.info(f"批量任务 {batch_id} 已初始化，总数: {total}")
 
     def add_batch_log(self, batch_id: str, log_message: str):
@@ -295,11 +302,11 @@ class TaskManager:
 
     def update_batch_status(self, batch_id: str, **kwargs):
         """更新批量任务状态"""
-        if batch_id not in _batch_status:
-            logger.warning(f"批量任务 {batch_id} 不存在")
-            return
-
-        _batch_status[batch_id].update(kwargs)
+        with _get_batch_lock(batch_id):
+            if batch_id not in _batch_status:
+                logger.warning(f"批量任务 {batch_id} 不存在")
+                return
+            _batch_status[batch_id].update(kwargs)
 
         # 异步广播状态更新
         if self._loop and self._loop.is_running():
@@ -331,7 +338,9 @@ class TaskManager:
 
     def get_batch_status(self, batch_id: str) -> Optional[dict]:
         """获取批量任务状态"""
-        return _batch_status.get(batch_id)
+        with _get_batch_lock(batch_id):
+            status = _batch_status.get(batch_id)
+            return status.copy() if status is not None else None
 
     def get_batch_logs(self, batch_id: str) -> List[str]:
         """获取批量任务日志"""
@@ -345,10 +354,11 @@ class TaskManager:
 
     def cancel_batch(self, batch_id: str):
         """取消批量任务"""
-        if batch_id in _batch_status:
-            _batch_status[batch_id]["cancelled"] = True
-            _batch_status[batch_id]["status"] = "cancelling"
-            logger.info(f"批量任务 {batch_id} 已标记为取消")
+        with _get_batch_lock(batch_id):
+            if batch_id in _batch_status:
+                _batch_status[batch_id]["cancelled"] = True
+                _batch_status[batch_id]["status"] = "cancelling"
+                logger.info(f"批量任务 {batch_id} 已标记为取消")
 
     def register_batch_websocket(self, batch_id: str, websocket) -> List[str]:
         """注册批量任务 WebSocket 连接，并返回注册时刻的历史日志快照"""

@@ -4,6 +4,7 @@
 
 import asyncio
 import logging
+import threading
 import uuid
 import random
 import re
@@ -32,9 +33,8 @@ router = APIRouter()
 
 # 任务存储（简单的内存存储，生产环境应使用 Redis）
 running_tasks: dict = {}
-# 批量任务存储
-batch_tasks: Dict[str, dict] = {}
 email_service_circuit_breakers: Dict[int, EmailProviderBackoffState] = {}
+_email_service_backoff_lock = threading.Lock()
 
 
 # ============== Proxy Helper Functions ==============
@@ -323,6 +323,75 @@ def _record_email_service_timeout_backoff(
     return _store_email_service_backoff_state(service_id, backoff_state)
 
 
+def _run_registration_engine_attempt(
+    task_uuid: str,
+    email_service,
+    actual_proxy_url: Optional[str],
+    log_callback,
+    db_service,
+):
+    """执行单次注册引擎尝试，并在同一临界区内维护邮箱服务退避状态。"""
+    provider_backoff_before_run = EmailProviderBackoffState()
+
+    with _email_service_backoff_lock:
+        if db_service is not None:
+            provider_backoff_before_run = _get_email_service_backoff_state(db_service.id)
+            if hasattr(email_service, "apply_provider_backoff_state"):
+                email_service.apply_provider_backoff_state(provider_backoff_before_run)
+
+        engine = RegistrationEngine(
+            email_service=email_service,
+            proxy_url=actual_proxy_url,
+            callback_logger=log_callback,
+            task_uuid=task_uuid,
+        )
+
+        try:
+            result = engine.run()
+        finally:
+            close_engine = getattr(engine, "close", None)
+            if callable(close_engine):
+                close_engine()
+
+        email_prepare_phase = _get_phase_result(
+            getattr(engine, "phase_history", []),
+            "email_prepare",
+        )
+        if db_service is not None and email_prepare_phase is not None:
+            _store_email_service_backoff_state(
+                db_service.id,
+                getattr(email_prepare_phase, "provider_backoff", None),
+            )
+
+        if (
+            db_service is not None
+            and not result.success
+            and result.error_code == ERROR_OTP_TIMEOUT_SECONDARY
+        ):
+            timeout_backoff = _record_email_service_timeout_backoff(
+                db_service.id,
+                email_service,
+                provider_backoff_before_run,
+                result.error_code,
+                result.error_message,
+            )
+        else:
+            timeout_backoff = None
+
+    return engine, result, email_prepare_phase, provider_backoff_before_run, timeout_backoff
+
+
+def _get_batch_snapshot(batch_id: str) -> Optional[dict]:
+    return task_manager.get_batch_status(batch_id)
+
+
+def _require_batch_snapshot(batch_id: str) -> dict:
+    batch = _get_batch_snapshot(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="批量任务不存在")
+    return batch
+
+
 def _build_email_service_candidates(
     db,
     service_type: EmailServiceType,
@@ -506,34 +575,19 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         candidate_config,
                         name=db_service.name if db_service is not None else None,
                     )
-                    provider_backoff_before_run = EmailProviderBackoffState()
-                    if db_service is not None:
-                        provider_backoff_before_run = _get_email_service_backoff_state(db_service.id)
-                    if db_service is not None and hasattr(email_service, "apply_provider_backoff_state"):
-                        email_service.apply_provider_backoff_state(provider_backoff_before_run)
-                    engine = RegistrationEngine(
+                    (
+                        engine,
+                        result,
+                        email_prepare_phase,
+                        _,
+                        timeout_backoff,
+                    ) = _run_registration_engine_attempt(
+                        task_uuid=task_uuid,
                         email_service=email_service,
-                        proxy_url=actual_proxy_url,
-                        callback_logger=log_callback,
-                        task_uuid=task_uuid
+                        actual_proxy_url=actual_proxy_url,
+                        log_callback=log_callback,
+                        db_service=db_service,
                     )
-
-                    try:
-                        result = engine.run()
-                    finally:
-                        close_engine = getattr(engine, "close", None)
-                        if callable(close_engine):
-                            close_engine()
-
-                    email_prepare_phase = _get_phase_result(
-                        getattr(engine, "phase_history", []),
-                        "email_prepare",
-                    )
-                    if db_service is not None and email_prepare_phase is not None:
-                        _store_email_service_backoff_state(
-                            db_service.id,
-                            getattr(email_prepare_phase, "provider_backoff", None),
-                        )
 
                     if result.success:
                         break
@@ -551,28 +605,17 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         and email_prepare_phase.provider_backoff is not None
                     )
                     if not can_failover:
-                        if (
-                            db_service is not None
-                            and result.error_code == ERROR_OTP_TIMEOUT_SECONDARY
-                        ):
-                            timeout_backoff = _record_email_service_timeout_backoff(
-                                db_service.id,
-                                email_service,
-                                provider_backoff_before_run,
-                                result.error_code,
-                                result.error_message,
+                        if timeout_backoff is not None:
+                            logger.warning(
+                                f"邮箱服务 OTP 超时，已退避 {db_service.name} "
+                                f"{timeout_backoff.delay_seconds} 秒，连续失败 "
+                                f"{timeout_backoff.failures} 次"
                             )
-                            if timeout_backoff is not None:
-                                logger.warning(
-                                    f"邮箱服务 OTP 超时，已退避 {db_service.name} "
-                                    f"{timeout_backoff.delay_seconds} 秒，连续失败 "
-                                    f"{timeout_backoff.failures} 次"
-                                )
-                                log_callback(
-                                    f"[系统] 邮箱服务 OTP 超时，退避 "
-                                    f"{timeout_backoff.delay_seconds} 秒: {db_service.name} "
-                                    f"(连续失败 {timeout_backoff.failures} 次)"
-                                )
+                            log_callback(
+                                f"[系统] 邮箱服务 OTP 超时，退避 "
+                                f"{timeout_backoff.delay_seconds} 秒: {db_service.name} "
+                                f"(连续失败 {timeout_backoff.failures} 次)"
+                            )
                         break
 
                     backoff_state = email_prepare_phase.provider_backoff
@@ -799,30 +842,15 @@ async def run_registration_task(task_uuid: str, email_service_type: str, proxy: 
 
 def _init_batch_state(batch_id: str, task_uuids: List[str]):
     """初始化批量任务内存状态"""
-    task_manager.init_batch(batch_id, len(task_uuids))
-    batch_tasks[batch_id] = {
-        "total": len(task_uuids),
-        "completed": 0,
-        "success": 0,
-        "failed": 0,
-        "cancelled": False,
-        "task_uuids": task_uuids,
-        "current_index": 0,
-        "logs": [],
-        "finished": False
-    }
+    task_manager.init_batch(batch_id, len(task_uuids), task_uuids=task_uuids)
 
 
 def _make_batch_helpers(batch_id: str):
     """返回 add_batch_log 和 update_batch_status 辅助函数"""
     def add_batch_log(msg: str):
-        batch_tasks[batch_id]["logs"].append(msg)
         task_manager.add_batch_log(batch_id, msg)
 
     def update_batch_status(**kwargs):
-        for key, value in kwargs.items():
-            if key in batch_tasks[batch_id]:
-                batch_tasks[batch_id][key] = value
         task_manager.update_batch_status(batch_id, **kwargs)
 
     return add_batch_log, update_batch_status
@@ -866,9 +894,10 @@ async def run_batch_parallel(
             t = crud.get_registration_task(db, uuid)
             if t:
                 async with counter_lock:
-                    new_completed = batch_tasks[batch_id]["completed"] + 1
-                    new_success = batch_tasks[batch_id]["success"]
-                    new_failed = batch_tasks[batch_id]["failed"]
+                    batch_snapshot = _get_batch_snapshot(batch_id) or {}
+                    new_completed = batch_snapshot.get("completed", 0) + 1
+                    new_success = batch_snapshot.get("success", 0)
+                    new_failed = batch_snapshot.get("failed", 0)
                     if t.status == "completed":
                         new_success += 1
                         add_batch_log(f"{prefix} [成功] 注册成功")
@@ -880,7 +909,11 @@ async def run_batch_parallel(
     try:
         await asyncio.gather(*[_run_one(i, u) for i, u in enumerate(task_uuids)], return_exceptions=True)
         if not task_manager.is_batch_cancelled(batch_id):
-            add_batch_log(f"[完成] 批量任务完成！成功: {batch_tasks[batch_id]['success']}, 失败: {batch_tasks[batch_id]['failed']}")
+            batch_snapshot = _get_batch_snapshot(batch_id) or {}
+            add_batch_log(
+                f"[完成] 批量任务完成！成功: {batch_snapshot.get('success', 0)}, "
+                f"失败: {batch_snapshot.get('failed', 0)}"
+            )
             update_batch_status(finished=True, status="completed")
         else:
             update_batch_status(finished=True, status="cancelled")
@@ -888,8 +921,6 @@ async def run_batch_parallel(
         logger.error(f"批量任务 {batch_id} 异常: {e}")
         add_batch_log(f"[错误] 批量任务异常: {str(e)}")
         update_batch_status(finished=True, status="failed")
-    finally:
-        batch_tasks[batch_id]["finished"] = True
 
 
 async def run_batch_pipeline(
@@ -932,9 +963,10 @@ async def run_batch_pipeline(
                 t = crud.get_registration_task(db, uuid)
                 if t:
                     async with counter_lock:
-                        new_completed = batch_tasks[batch_id]["completed"] + 1
-                        new_success = batch_tasks[batch_id]["success"]
-                        new_failed = batch_tasks[batch_id]["failed"]
+                        batch_snapshot = _get_batch_snapshot(batch_id) or {}
+                        new_completed = batch_snapshot.get("completed", 0) + 1
+                        new_success = batch_snapshot.get("success", 0)
+                        new_failed = batch_snapshot.get("failed", 0)
                         if t.status == "completed":
                             new_success += 1
                             add_batch_log(f"{pfx} [成功] 注册成功")
@@ -947,7 +979,7 @@ async def run_batch_pipeline(
 
     try:
         for i, task_uuid in enumerate(task_uuids):
-            if task_manager.is_batch_cancelled(batch_id) or batch_tasks[batch_id]["cancelled"]:
+            if task_manager.is_batch_cancelled(batch_id):
                 with get_db() as db:
                     for remaining_uuid in task_uuids[i:]:
                         crud.update_registration_task(db, remaining_uuid, status="cancelled")
@@ -971,14 +1003,16 @@ async def run_batch_pipeline(
             await asyncio.gather(*running_tasks_list, return_exceptions=True)
 
         if not task_manager.is_batch_cancelled(batch_id):
-            add_batch_log(f"[完成] 批量任务完成！成功: {batch_tasks[batch_id]['success']}, 失败: {batch_tasks[batch_id]['failed']}")
+            batch_snapshot = _get_batch_snapshot(batch_id) or {}
+            add_batch_log(
+                f"[完成] 批量任务完成！成功: {batch_snapshot.get('success', 0)}, "
+                f"失败: {batch_snapshot.get('failed', 0)}"
+            )
             update_batch_status(finished=True, status="completed")
     except Exception as e:
         logger.error(f"批量任务 {batch_id} 异常: {e}")
         add_batch_log(f"[错误] 批量任务异常: {str(e)}")
         update_batch_status(finished=True, status="failed")
-    finally:
-        batch_tasks[batch_id]["finished"] = True
 
 
 async def run_batch_registration(
@@ -1157,10 +1191,7 @@ async def start_batch_registration(
 @router.get("/batch/{batch_id}")
 async def get_batch_status(batch_id: str):
     """获取批量任务状态"""
-    if batch_id not in batch_tasks:
-        raise HTTPException(status_code=404, detail="批量任务不存在")
-
-    batch = batch_tasks[batch_id]
+    batch = _require_batch_snapshot(batch_id)
     return {
         "batch_id": batch_id,
         "total": batch["total"],
@@ -1177,14 +1208,10 @@ async def get_batch_status(batch_id: str):
 @router.post("/batch/{batch_id}/cancel")
 async def cancel_batch(batch_id: str):
     """取消批量任务"""
-    if batch_id not in batch_tasks:
-        raise HTTPException(status_code=404, detail="批量任务不存在")
-
-    batch = batch_tasks[batch_id]
+    batch = _require_batch_snapshot(batch_id)
     if batch.get("finished"):
         raise HTTPException(status_code=400, detail="批量任务已完成")
 
-    batch["cancelled"] = True
     task_manager.cancel_batch(batch_id)
     return {"success": True, "message": "批量任务取消请求已提交"}
 
@@ -1666,18 +1693,12 @@ async def start_outlook_batch_registration(
     batch_id = str(uuid.uuid4())
 
     # 初始化批量任务状态
-    batch_tasks[batch_id] = {
-        "total": len(actual_service_ids),
-        "completed": 0,
-        "success": 0,
-        "failed": 0,
-        "skipped": 0,
-        "cancelled": False,
-        "service_ids": actual_service_ids,
-        "current_index": 0,
-        "logs": [],
-        "finished": False
-    }
+    task_manager.init_batch(
+        batch_id,
+        len(actual_service_ids),
+        skipped=skipped_count,
+        service_ids=actual_service_ids,
+    )
 
     # 在后台运行批量注册
     background_tasks.add_task(
@@ -1710,10 +1731,7 @@ async def start_outlook_batch_registration(
 @router.get("/outlook-batch/{batch_id}")
 async def get_outlook_batch_status(batch_id: str):
     """获取 Outlook 批量任务状态"""
-    if batch_id not in batch_tasks:
-        raise HTTPException(status_code=404, detail="批量任务不存在")
-
-    batch = batch_tasks[batch_id]
+    batch = _require_batch_snapshot(batch_id)
     return {
         "batch_id": batch_id,
         "total": batch["total"],
@@ -1724,7 +1742,8 @@ async def get_outlook_batch_status(batch_id: str):
         "current_index": batch["current_index"],
         "cancelled": batch["cancelled"],
         "finished": batch.get("finished", False),
-        "logs": batch.get("logs", []),
+        "service_ids": batch.get("service_ids", []),
+        "logs": task_manager.get_batch_logs(batch_id),
         "progress": f"{batch['completed']}/{batch['total']}"
     }
 
@@ -1732,15 +1751,10 @@ async def get_outlook_batch_status(batch_id: str):
 @router.post("/outlook-batch/{batch_id}/cancel")
 async def cancel_outlook_batch(batch_id: str):
     """取消 Outlook 批量任务"""
-    if batch_id not in batch_tasks:
-        raise HTTPException(status_code=404, detail="批量任务不存在")
-
-    batch = batch_tasks[batch_id]
+    batch = _require_batch_snapshot(batch_id)
     if batch.get("finished"):
         raise HTTPException(status_code=400, detail="批量任务已完成")
 
-    # 同时更新两个系统的取消状态
-    batch["cancelled"] = True
     task_manager.cancel_batch(batch_id)
 
     return {"success": True, "message": "批量任务取消请求已提交"}

@@ -69,3 +69,36 @@ def test_phase_otp_secondary_returns_dedicated_timeout_error_code(monkeypatch):
     assert phase_result.success is False
     assert phase_result.error_code == ERROR_OTP_TIMEOUT_SECONDARY
     assert engine.phase_history[0].error_code == ERROR_OTP_TIMEOUT_SECONDARY
+
+
+def test_advance_login_authorization_refreshes_otp_anchor_after_password_submit(monkeypatch):
+    email_service = FakeEmailService(code=None)
+    engine = _build_engine(monkeypatch, email_service)
+    engine.oauth_start = object()
+    engine._otp_sent_at = 10.0
+
+    monkeypatch.setattr(register_module.time, "time", lambda: 456.0)
+    monkeypatch.setattr(engine, "_init_session", lambda: True)
+    monkeypatch.setattr(engine, "_start_oauth", lambda: True)
+    monkeypatch.setattr(engine, "_get_device_id", lambda: True)
+    monkeypatch.setattr(engine, "_try_reenter_login_flow", lambda: True)
+    monkeypatch.setattr(
+        engine,
+        "_submit_login_password_step_and_get_continue_url",
+        lambda: (True, "https://continue.example.test"),
+    )
+
+    seen_anchors = []
+
+    def fake_get_verification_code():
+        seen_anchors.append(engine._otp_sent_at)
+        return None
+
+    monkeypatch.setattr(engine, "_get_verification_code", fake_get_verification_code)
+
+    workspace_id, callback_url = engine._advance_login_authorization()
+
+    assert workspace_id is None
+    assert callback_url is None
+    assert engine._otp_sent_at == 456.0
+    assert seen_anchors == [456.0]

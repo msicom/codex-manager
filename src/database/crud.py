@@ -5,6 +5,7 @@
 from typing import List, Optional, Dict, Any, Union, Iterable, Set
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import and_, or_, desc, asc, func
 
 from .models import Account, EmailService, RegistrationTask, Setting, Proxy, CpaService, Sub2ApiService
@@ -778,6 +779,8 @@ def delete_tm_service(db: Session, service_id: int) -> bool:
     db.delete(svc)
     db.commit()
     return True
+
+
 def update_outlook_refresh_token(db: Session, service_id: int, email: str, new_refresh_token: str):
     """更新 EmailService.config 中指定邮箱的 refresh_token"""
     service = db.query(EmailService).filter(EmailService.id == service_id).first()
@@ -808,4 +811,5 @@ def update_outlook_refresh_token(db: Session, service_id: int, email: str, new_r
         return
 
     service.config = config
+    flag_modified(service, "config")
     db.commit()

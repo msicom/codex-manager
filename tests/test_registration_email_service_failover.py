@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import src.services.base as base_module
@@ -412,3 +413,128 @@ def test_registration_task_success_clears_email_service_backoff(monkeypatch):
     )
 
     assert service_id not in registration_routes.email_service_circuit_breakers
+
+
+def test_registration_task_backoff_failures_do_not_get_lost_under_concurrency(monkeypatch):
+    runtime_dir = Path("tests_runtime")
+    runtime_dir.mkdir(exist_ok=True)
+    db_path = runtime_dir / "registration_backoff_concurrency.db"
+    if db_path.exists():
+        db_path.unlink()
+
+    manager = DatabaseSessionManager(f"sqlite:///{db_path}")
+    Base.metadata.create_all(bind=manager.engine)
+
+    task_uuids = ["task-backoff-1", "task-backoff-2"]
+    with manager.session_scope() as session:
+        for task_uuid in task_uuids:
+            session.add(RegistrationTask(task_uuid=task_uuid, status="pending"))
+        session.add(
+            EmailService(
+                service_type="duck_mail",
+                name="duck-primary",
+                config={
+                    "base_url": "https://mail-1.example.test",
+                    "default_domain": "mail.example.test",
+                },
+                enabled=True,
+                priority=0,
+            )
+        )
+
+    @contextmanager
+    def fake_get_db():
+        session = manager.SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    class DummySettings:
+        pass
+
+    start_lock = threading.Lock()
+    started = {"count": 0}
+    peer_started = threading.Event()
+
+    class FakeRegistrationEngine:
+        def __init__(self, email_service, proxy_url=None, callback_logger=None, task_uuid=None):
+            self.email_service = email_service
+            self.phase_history = []
+
+        def run(self):
+            with start_lock:
+                started["count"] += 1
+                if started["count"] == len(task_uuids):
+                    peer_started.set()
+            peer_started.wait(timeout=0.1)
+
+            current_state = self.email_service.provider_backoff_state
+            next_failures = current_state.failures + 1
+            delay_seconds = 30 if next_failures == 1 else 60
+            self.phase_history = [
+                PhaseResult(
+                    phase="email_prepare",
+                    success=False,
+                    error_message="创建邮箱失败",
+                    error_code="EMAIL_PROVIDER_RATE_LIMITED",
+                    retryable=True,
+                    next_action="switch_provider",
+                    provider_backoff=EmailProviderBackoffState(
+                        failures=next_failures,
+                        delay_seconds=delay_seconds,
+                        opened_until=1000.0 + delay_seconds,
+                        last_error="请求失败: 429",
+                    ),
+                )
+            ]
+            return RegistrationResult(
+                success=False,
+                error_message="创建邮箱失败: 请求失败: 429",
+                logs=[],
+            )
+
+        def save_to_database(self, result):
+            return True
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(registration_routes, "get_db", fake_get_db)
+    monkeypatch.setattr(registration_routes, "get_settings", lambda: DummySettings())
+    monkeypatch.setattr(registration_routes, "task_manager", DummyTaskManager())
+    monkeypatch.setattr(registration_routes, "RegistrationEngine", FakeRegistrationEngine)
+    monkeypatch.setattr(
+        registration_routes.EmailServiceFactory,
+        "create",
+        lambda service_type, config, name=None: BackoffAwareEmailService(
+            service_type=service_type,
+            config=config,
+            name=name,
+        ),
+    )
+    registration_routes.email_service_circuit_breakers.clear()
+
+    with manager.session_scope() as session:
+        service_id = session.query(EmailService.id).filter(EmailService.name == "duck-primary").scalar()
+
+    threads = [
+        threading.Thread(
+            target=registration_routes._run_sync_registration_task,
+            kwargs={
+                "task_uuid": task_uuid,
+                "email_service_type": EmailServiceType.DUCK_MAIL.value,
+                "proxy": None,
+                "email_service_config": None,
+            },
+        )
+        for task_uuid in task_uuids
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    state = registration_routes.email_service_circuit_breakers[service_id]
+    assert state.failures == 2
+    assert state.delay_seconds == 60
